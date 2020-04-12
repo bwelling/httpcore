@@ -140,20 +140,23 @@ class AsyncHTTPProxy(AsyncConnectionPool):
         connection = await self._get_connection_from_pool(origin)
 
         if connection is None:
+            # Establish a connection to the proxy server. We temporarily use the origin
+            # of the proxy while we set up the tunnel.
             connection = AsyncHTTPConnection(
-                origin=origin, http2=False, ssl_context=self._ssl_context,
+                origin=self.proxy_origin, http2=False, ssl_context=self._ssl_context,
             )
-            async with self._thread_lock:
-                self._connections.setdefault(origin, set())
-                self._connections[origin].add(connection)
+            await self._add_to_pool(connection, timeout=timeout)
+            # async with self._thread_lock:
+            #     self._connections.setdefault(origin, set())
+            #     self._connections[origin].add(connection)
 
-            # Establish the connection by issuing a CONNECT request...
+            # Issue a CONNECT request...
 
             # CONNECT www.example.org:80 HTTP/1.1
             # [proxy-headers]
             target = b"%b:%d" % (url[1], url[2])
             connect_url = self.proxy_origin + (target,)
-            connect_headers = self.proxy_headers
+            connect_headers = self.proxy_headers or [(b"host", self.proxy_origin[1])]
             proxy_response = await connection.request(
                 b"CONNECT", connect_url, headers=connect_headers, timeout=timeout
             )
@@ -161,21 +164,26 @@ class AsyncHTTPProxy(AsyncConnectionPool):
             proxy_reason_phrase = proxy_response[2]
             proxy_stream = proxy_response[4]
 
-            # Ingest any request body.
-            await read_body(proxy_stream)
+            # Ingest any request body, without closing the socket.
+            async for chunk in proxy_stream:
+                pass
 
             # If the proxy responds with an error, then drop the connection
             # from the pool, and raise an exception.
             if proxy_status_code < 200 or proxy_status_code > 299:
-                async with self._thread_lock:
-                    self._connections[connection.origin].remove(connection)
-                    if not self._connections[connection.origin]:
-                        del self._connections[connection.origin]
+                await self._remove_from_pool(connection)
+                # async with self._thread_lock:
+                #     self._connections[connection.origin].remove(connection)
+                #     if not self._connections[connection.origin]:
+                #         del self._connections[connection.origin]
                 msg = "%d %s" % (proxy_status_code, proxy_reason_phrase.decode("ascii"))
                 raise ProxyError(msg)
 
             # Upgrade to TLS.
             await connection.start_tls(target, timeout)
+
+            # Switch the origin to the requested one for making normal requests.
+            connection.origin = origin
 
         # Once the connection has been established we can send requests on
         # it as normal.
